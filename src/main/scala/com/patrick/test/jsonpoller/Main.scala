@@ -24,8 +24,10 @@ import DownloadItemAccumulatorActorProtocol._
 import DownloadItemActorProtocol._
 import spray.client.pipelining._
 import scala.concurrent.duration._
+import java.util.concurrent.atomic.AtomicInteger
 
-import akka.actor.Kill
+import akka.event.Logging
+import akka.actor.ActorLogging
 
 // Transfer Objects
 case class UrlItemList(urls: List[UrlItem])
@@ -65,7 +67,9 @@ object Main extends App with SimpleRoutingApp with SprayJsonSupport {
 
   implicit val system = ActorSystem("main")
   implicit val ec = system.dispatcher
-  implicit val timeout = Timeout(30 seconds)
+  implicit val timeout = Timeout(60 seconds)
+
+  val log = Logging(system, this.getClass)
 
   startServer(interface = "localhost", port = 8080) {
     path("take" / IntNumber) { take =>
@@ -73,19 +77,32 @@ object Main extends App with SimpleRoutingApp with SprayJsonSupport {
         produce(instanceOf[List[ResultItem]]) { completeFunction =>
           requestContext =>
 
-            // quick and dirty way to clean up
-            //            val perRequestSystem = ActorSystem()
-            // "http://peaceful-falls-6706.herokuapp.com/sample"
-            val sampleActor = system.actorOf(Props(new SampleActor("http://localhost/test.json", take)))
-            val f = (sampleActor ? RequestResults()).mapTo[List[ResultItem]]
+            // i couldn't find a quick solution to stop all child actors from continuing to work, so i opt'd towards the easy
+            // route of a quick and dirty way to clean up... shutdown the entire system
+            val perRequestSystem = ActorSystem()
 
-            Await.ready(f, 30 seconds)
+            try {
 
-            val result = Await.result(f, 0 seconds)
+              val sampleActor = perRequestSystem.actorOf(Props(new SampleActor("http://peaceful-falls-6706.herokuapp.com/sample", take)))
+              val f = (sampleActor ? RequestResults).mapTo[List[ResultItem]]
 
-            //            perRequestSystem.shutdown()
+              // wait for only 30 seconds to complete
+              Await.ready(f, 50 seconds)
 
-            completeFunction(result)
+              // grab what results are available
+              val f2 = (sampleActor ? GetResults).mapTo[List[ResultItem]]
+              val result = Await.result(f2, 5 seconds)
+              completeFunction(result)
+
+            } catch {
+              case e: Throwable => {
+                log.error(s"Error encountered: $e")
+                completeFunction(List[ResultItem]())
+              }
+            } finally {
+              // shut down all workers
+              perRequestSystem.shutdown()
+            }
         }
       }
     }
@@ -94,9 +111,9 @@ object Main extends App with SimpleRoutingApp with SprayJsonSupport {
   sys.addShutdownHook(system.shutdown())
 }
 
-case class BadResponseException(url: String) extends Exception
+case class BadResponseException(val statusCode: Int, val url: String) extends Exception
 
-class SampleActor(url: String, take: Int) extends Actor {
+class SampleActor(url: String, take: Int) extends Actor with ActorLogging {
 
   import akka.actor.OneForOneStrategy
   import akka.actor.SupervisorStrategy._
@@ -106,6 +123,11 @@ class SampleActor(url: String, take: Int) extends Actor {
 
   var originalSender: ActorRef = null
 
+  var done = false
+
+  var retryCounts = 0
+  var errorCounts = 0
+
   val buf = ListBuffer.empty[ResultItem]
 
   // create up to at most 10 worker actors to download the contents of each url
@@ -113,33 +135,41 @@ class SampleActor(url: String, take: Int) extends Actor {
     .withRouter(RoundRobinRouter(nrOfInstances = Math.min(10, take * 2)))
     .withDispatcher("download-item-dispatcher"))
 
+  // restart the worker for a max of 5 retries within a time span of 60 seconds
   override val supervisorStrategy = OneForOneStrategy(
-    maxNrOfRetries = 100,
-    withinTimeRange = 30 seconds) {
-      case _: BadResponseException => {
-        println("restarting ")
+    maxNrOfRetries = 5,
+    withinTimeRange = 60 seconds) {
+      case BadResponseException(400, url) => {
+        log.warning(s"$url returned status code 400, restarting actor")
         Restart
       }
-      case _: IllegalArgumentException => Stop
+      case BadResponseException(500, url) => {
+        log.warning(s"$url returned status code 500, ignoring url")
+        Resume
+      }
       case _: Exception => Escalate
     }
 
   def receive = {
-    case RequestResults => { println("work requested"); originalSender = sender; fetchSampleItems(url, take) }
+    case RequestResults => { originalSender = sender; fetchSampleItems(url, take) }
     case GetItem(url) => itemActors ! GetItem(url)
     case ResultItemReady(item) => {
-      println(s"result item ready: $item")
+      log.debug(s"result item ready: $item")
       buf += item
-      if (buf.length >= take) {
-        println(s"buffer satisfied: ${buf.length}")
+      if (!done && buf.length >= take) {
+        done = true
+        log.info(s"take count satisfied: ${buf.length}")
         originalSender ! buf.toList
       }
     }
-    case GetResults => originalSender ! buf.toList
+    case GetResults => {
+      log.debug(s"sending results: ${buf.toList}")
+      sender ! buf.toList
+    }
   }
 
   private def fetchSampleItems(url: String, take: Int) = {
-    println(s"fetchSample requested for $url with a take of $take")
+    log.debug(s"fetchSample requested for $url 1a take of $take")
 
     val sample = Await.result({
       val pipeline = sendReceive
@@ -148,15 +178,16 @@ class SampleActor(url: String, take: Int) extends Actor {
 
     val urls = sample.entity.asString.asJson.convertTo[UrlItemList].urls
 
+    log.info(s"Found ${urls.length} urls")
+
     // fire off messages to the item actors to have them work on downloading the urls
     urls.foreach(u => itemActors ! GetItem(u.url))
-  }
 
-  override def preStart() = { println("Start SampleActor'"); super.preStart() }
-  override def postStop() = { println("Stop SampleActor'"); super.postStop() }
+    log.debug("done queuing download tasks")
+  }
 }
 
-class DownloadItemActor extends Actor {
+class DownloadItemActor extends Actor with ActorLogging {
 
   implicit val ec = context.dispatcher
   implicit val timeout = Timeout(30 seconds)
@@ -168,21 +199,11 @@ class DownloadItemActor extends Actor {
   private def fetchItem(url: String): ResultItem = {
     val pipeline: SendReceive = sendReceive
     val f = pipeline(Get(url))
-
-    f onSuccess {
-      case r if r.status == 200 => r
-      case r if r.status == 400 => throw new BadResponseException(url)
+    log.debug(s"waiting for $url response")
+    val response = Await.result(f, 20 seconds)
+    response.status.intValue match {
+      case 200 => response.entity.asString.asJson.convertTo[ResultItem]
+      case code => throw new BadResponseException(code, url)
     }
-    f onFailure { case r => println(s"$url failed with ${r.getMessage()}") }
-
-    Await.result(f, 20 seconds).entity.asString.asJson.convertTo[ResultItem]
-  }
-
-  override def preStart() = { println("Start DownloadItemActor'"); super.preStart() }
-  override def postStop() = { println("Stop DownloadItemActor'"); super.postStop() }
-
-  override def preRestart(reason: Throwable, message: Option[Any]): Unit = {
-    println("Restart DownloadItemActor: ${reason.getClass}")
-    super.preRestart(reason, message);
   }
 }
