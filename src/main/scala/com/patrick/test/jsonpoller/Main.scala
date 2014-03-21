@@ -35,6 +35,7 @@ object Main extends App with SimpleRoutingApp with SprayJsonSupport {
             completeFunction {
               // i couldn't find a quick solution to stop all child actors from continuing to work, so i opt'd towards the easy
               // route of a quick and dirty way to clean up... shutdown the entire system
+              // have to spend more time looking at actor supervision of akka
               implicit val perRequestSystem = ActorSystem()
               implicit val ec = perRequestSystem.dispatcher
 
@@ -44,13 +45,15 @@ object Main extends App with SimpleRoutingApp with SprayJsonSupport {
                 val f = (sampleActor ? RequestResults).mapTo[List[ResultItem]]
 
                 try {
-                  // wait for only 30 seconds to complete
+                  // wait for at most 50 seconds to complete
                   Await.ready(f, 50 seconds)
                 } catch {
                   case toe: TimeoutException => log.warning("Continuing past timeout", toe)
                 }
 
-                // grab what results are available
+                log.warning("TIME EXPIRED, GRABBIG PARTIAL RESULTS")
+
+                // time has expired, we'll grab what results are available and return it to the user
                 val f2 = (sampleActor ? GetResults).mapTo[List[ResultItem]]
                 val result = Await.result(f2, 5 seconds)
                 result

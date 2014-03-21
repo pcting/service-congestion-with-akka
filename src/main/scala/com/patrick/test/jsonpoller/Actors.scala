@@ -59,15 +59,16 @@ class SampleActor(url: String, take: Int) extends Actor with ActorLogging {
 
   var done = false
 
+  // not sure what to do with these metrics
   var retryCounts = 0
   var statusCode500Count = 0
   var miscErrorCount = 0
 
   val buf = ListBuffer.empty[ResultItem]
 
-  // create up to at most 10 worker actors to download the contents of each url
+  // create up to at most 5 worker actors to download the contents of each url
   val itemActors = context.actorOf(Props[DownloadItemActor]
-    .withRouter(RoundRobinRouter(nrOfInstances = Math.min(3, take * 2)))
+    .withRouter(RoundRobinRouter(nrOfInstances = Math.min(5, take)))
     .withDispatcher("download-item-dispatcher"))
 
   // restart the worker for a max of 5 retries within a time span of 60 seconds
@@ -75,7 +76,7 @@ class SampleActor(url: String, take: Int) extends Actor with ActorLogging {
     maxNrOfRetries = 5,
     withinTimeRange = 60 seconds) {
       case BadResponseException(400, url, None) =>
-        log.warning(s"400 STATUS CODE FOUND, RESTARTING ACTOR, $url")
+        log.warning(s"400 STATUS CODE FOUND, RETRYING/RESTARTING ACTOR, $url")
         retryCounts += 1
         Restart
 
@@ -90,7 +91,7 @@ class SampleActor(url: String, take: Int) extends Actor with ActorLogging {
         Resume
 
       case _: TimeoutException =>
-        log.warning(s"400 STATUS CODE FOUND, RESTARTING ACTOR, $url")
+        log.warning(s"TIMEOUT FOUND, RETRYING/RESTARTING ACTOR, $url")
         retryCounts += 1
         Restart
 
@@ -109,11 +110,11 @@ class SampleActor(url: String, take: Int) extends Actor with ActorLogging {
       buf += item
       if (!done && buf.length >= take) {
         done = true
-        log.info(s"take count satisfied: ${buf.length}")
+        log.info(s"take count satisfied: ${buf.length}, metrics for this job => retries = $retryCounts, 500s = $statusCode500Count, others = $miscErrorCount")
         originalSender ! buf.toList
       }
     case GetResults =>
-      log.debug(s"sending results: ${buf.toList}")
+      log.info(s"sending partial results: ${buf.length}, metrics for this job => retries = $retryCounts, 500s = $statusCode500Count, others = $miscErrorCount")
       sender ! buf.toList
 
   }
@@ -153,7 +154,7 @@ class DownloadItemActor extends Actor with ActorLogging {
     val f = pipeline(Get(url))
     log.debug(s"waiting for $url response")
     try {
-      val response = Await.result(f, 20 seconds)
+      val response = Await.result(f, 30 seconds)
       response.status.intValue match {
         case 200 => response.entity.asString.asJson.convertTo[ResultItem]
         case code => throw new BadResponseException(code, url)
